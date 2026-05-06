@@ -282,7 +282,7 @@ def main():
     print("\nbaseline...")
     t = time.time()
     base = evaluate(prog, test, threads)
-    print(f"  {base:.3f}  ({time.time() - t:.0f}s)")
+    print(f"  {base}  ({time.time() - t:.0f}s)")
 
     print("\nGEPA optimizing...")
     t = time.time()
@@ -294,7 +294,7 @@ def main():
     print("\noptimized...")
     t = time.time()
     opt = evaluate(optimized, test, threads)
-    print(f"  {opt:.3f}  ({time.time() - t:.0f}s)")
+    print(f"  {opt}  ({time.time() - t:.0f}s)")
 
     out = Path("optimized_program")
     out.mkdir(exist_ok=True)
@@ -316,7 +316,7 @@ def main():
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    print(f"\nbaseline {base:.3f} → optimized {opt:.3f}  (Δ {opt - base:+.3f})")
+    print(f"\nbaseline {base} → optimized {opt}  (Δ {opt - base})")
     for name, instr in instructions.items():
         print(f"\n── {name} " + "─" * max(0, 66 - len(name)))
         print(instr)
