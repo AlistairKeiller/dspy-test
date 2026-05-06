@@ -9,61 +9,83 @@ from pathlib import Path
 import dspy
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
-HF = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main"
-DATA = Path(".bfcl_data")
+GH = "https://raw.githubusercontent.com/ShishirPatil/gorilla/main/berkeley-function-call-leaderboard/bfcl_eval/data"
+DATA = Path(".bfcl_v4_data")
 FILES = {
-    "mq": "BFCL_v3_live_multiple.json",
-    "ma": "possible_answer/BFCL_v3_live_multiple.json",
-    "iq": "BFCL_v3_live_irrelevance.json",
+    "mq": "BFCL_v4_live_multiple.json",
+    "ma": "possible_answer/BFCL_v4_live_multiple.json",
+    "rq": "BFCL_v4_live_relevance.json",
+    "iq": "BFCL_v4_live_irrelevance.json",
 }
+MAX_TOOLS_CHARS = 6000
 
 
 def fetch(remote, local):
     if not local.exists():
         local.parent.mkdir(parents=True, exist_ok=True)
-        print(f"  downloading {remote}")
-        urllib.request.urlretrieve(f"{HF}/{remote}", local)
+        print(f"  ↓ {remote}")
+        urllib.request.urlretrieve(f"{GH}/{remote}", local)
 
 
 def load_jsonl(path):
     return [json.loads(line) for line in open(path) if line.strip()]
 
 
-def load_splits(train_n=60, val_n=30, test_n=150, irrel_frac=0.3, seed=42):
-    DATA.mkdir(exist_ok=True)
-    for r in FILES.values():
-        fetch(r, DATA / r)
-    mult = load_jsonl(DATA / FILES["mq"])
-    answers = {r["id"]: r["ground_truth"] for r in load_jsonl(DATA / FILES["ma"])}
-    irrel = load_jsonl(DATA / FILES["iq"])
+def make_rows(qs, answers=None, synth_truth=False):
+    out = []
+    for q in qs:
+        msgs = q["question"][0]
+        text = "\n".join(m["content"] for m in msgs if m.get("role") == "user")
+        tools_json = json.dumps(q["function"], separators=(",", ":"))
+        if len(tools_json) > MAX_TOOLS_CHARS:
+            continue
+        if answers is not None:
+            gt = answers.get(q["id"], [])
+        elif synth_truth and q["function"]:
+            gt = [{q["function"][0]["name"]: {}}]
+        else:
+            gt = []
+        out.append({"request": text, "tools": q["function"], "ground_truth": gt})
+    return out
 
-    def row(q, gt):
-        text = "\n".join(
-            m["content"] for m in q["question"][0] if m.get("role") == "user"
-        )
-        return {"request": text, "tools": q["function"], "ground_truth": gt}
 
-    rng = random.Random(seed)
-    rng.shuffle(mult)
-    rng.shuffle(irrel)
-    n = train_n + val_n + test_n
-    n_irrel = int(irrel_frac * n)
-    pool = [row(q, answers.get(q["id"], [])) for q in mult[: n - n_irrel]] + [
-        row(q, []) for q in irrel[:n_irrel]
-    ]
-    rng.shuffle(pool)
-    examples = [
+def to_examples(rows):
+    return [
         dspy.Example(
             request=r["request"],
             tools=json.dumps(r["tools"], separators=(",", ":")),
             ground_truth=json.dumps(r["ground_truth"], separators=(",", ":")),
         ).with_inputs("request", "tools")
-        for r in pool
+        for r in rows
     ]
+
+
+def load_splits(train_n=50, val_n=40, test_n=150, seed=42):
+    DATA.mkdir(exist_ok=True)
+    for r in FILES.values():
+        fetch(r, DATA / r)
+    rng = random.Random(seed)
+
+    mult = make_rows(
+        load_jsonl(DATA / FILES["mq"]),
+        {r["id"]: r["ground_truth"] for r in load_jsonl(DATA / FILES["ma"])},
+    )
+    rel = make_rows(load_jsonl(DATA / FILES["rq"]), synth_truth=True)
+    irrel = make_rows(load_jsonl(DATA / FILES["iq"]))
+    rng.shuffle(mult)
+    rng.shuffle(rel)
+    rng.shuffle(irrel)
+
+    n = train_n + val_n + test_n
+    n_irrel, n_mult = n // 2, int(n * 0.35)
+    n_rel = n - n_irrel - n_mult
+    pool = mult[:n_mult] + rel[:n_rel] + irrel[:n_irrel]
+    rng.shuffle(pool)
+    examples = to_examples(pool)
     return (
         examples[:train_n],
         examples[train_n : train_n + val_n],
-        examples[train_n + val_n :],
+        examples[train_n + val_n : n],
     )
 
 
@@ -85,7 +107,7 @@ class SelectToolCall(dspy.Signature):
 class ToolUseProgram(dspy.Module):
     def __init__(self):
         super().__init__()
-        self.select = dspy.Predict(SelectToolCall)
+        self.select = dspy.ChainOfThought(SelectToolCall)
 
     def forward(self, request, tools):
         return self.select(request=request, tools=tools)
@@ -99,6 +121,8 @@ def parse_call(raw):
         s = s[4:].strip()
     if "{" in s and not s.startswith("{"):
         s = s[s.find("{") :]
+    if s.endswith("```"):
+        s = s[:-3].rstrip()
     try:
         obj = json.loads(s)
     except Exception:
@@ -134,20 +158,32 @@ def matches(pred, accepted):
     return False
 
 
-def score_call(pred, gold):
+def score_call(pred, gold, tools):
     name, args = pred["name"], pred["arguments"]
     if not gold:
         if name is None:
             return 1.0, "Correctly abstained — no tool fits this request."
         return 0.0, (
-            f"Over-called `{name}`: none of the available tools answer this. "
-            'When intent does not map to a tool, output {"name": null, "arguments": {}}.'
+            f"Over-called `{name}`: none of the available tools fit this request. "
+            'When the user\'s intent does not clearly map to a tool, output {"name": null, "arguments": {}}. '
+            "Topical proximity is not the same as fit — read each description literally."
         )
     gold_name, gold_args = next(iter(gold[0].items()))
     if name is None:
-        return 0.0, f"Under-called: should have invoked `{gold_name}`."
+        return (
+            0.0,
+            f"Under-called: should have invoked `{gold_name}`. The user's request maps to this tool.",
+        )
     if name != gold_name:
-        return 0.0, f"Wrong tool: predicted `{name}`, expected `{gold_name}`."
+        gold_desc = next(
+            (t.get("description", "") for t in tools if t.get("name") == gold_name), ""
+        )
+        return 0.0, (
+            f"Wrong tool: predicted `{name}`, expected `{gold_name}` — for: {gold_desc[:180]}. "
+            "Pick the tool whose stated purpose most directly matches the request."
+        )
+    if not gold_args:
+        return 1.0, f"Correctly invoked `{gold_name}`."
     required = [a for a, acc in gold_args.items() if "" not in acc]
     optional = [a for a in gold_args if a not in required]
     correct, issues = 0, []
@@ -157,13 +193,23 @@ def score_call(pred, gold):
         elif matches(args[a], gold_args[a]):
             correct += 1
         else:
-            issues.append(f"`{a}`={args[a]!r} expected one of {gold_args[a]!r}")
+            ref = next((v for v in gold_args[a] if v != ""), None)
+            kind = (
+                "wrong type"
+                if ref is not None and type(args[a]) is not type(ref)
+                else "wrong value"
+            )
+            issues.append(
+                f"`{a}`={args[a]!r} ({kind}); expected one of {gold_args[a]!r}"
+            )
     for a in optional:
         if a in args and matches(args[a], gold_args[a]):
             correct += 1
     extra = [a for a in args if a not in gold_args]
     if extra:
-        issues.append(f"unrequested args: {extra}")
+        issues.append(
+            f"unrequested args {extra} — only include args the user specified"
+        )
     total = len(required) + len(optional)
     score = 0.5 + 0.5 * (correct / total if total else 1.0)
     if score == 1.0 and not issues:
@@ -171,8 +217,7 @@ def score_call(pred, gold):
     return score, (
         f"Right tool (`{gold_name}`), but: "
         + "; ".join(issues)
-        + ". Extract values directly from the request, match types, "
-        "and don't add args the user didn't specify."
+        + ". Extract values directly from the request and match expected types exactly."
     )
 
 
@@ -183,11 +228,11 @@ def metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
             0.0,
             (
                 "Output was not valid JSON. Always emit a single JSON object: "
-                '{"name": <tool|null>, "arguments": {...}} with no prose or fences.'
+                '{"name": <tool|null>, "arguments": {...}} with no prose, fences, or trailing commas.'
             ),
         )
     else:
-        s, fb = score_call(call, json.loads(gold.ground_truth))
+        s, fb = score_call(call, json.loads(gold.ground_truth), json.loads(gold.tools))
     return ScoreWithFeedback(score=s, feedback=fb) if pred_name else s
 
 
@@ -208,12 +253,12 @@ def reflection_lm():
         print("→ reflection: GPT")
         return dspy.LM("openai/gpt-5", temperature=1.0, max_tokens=32000)
     print(
-        "→ reflection: local gemma4:31b (set ANTHROPIC_API_KEY or OPENAI_API_KEY for speed)"
+        "→ reflection: local gemma4:31b (set ANTHROPIC_API_KEY or OPENAI_API_KEY for speed/quality)"
     )
     return make_lm("gemma4:31b", temperature=1.0, max_tokens=8000)
 
 
-def evaluate(prog, data, threads=8):
+def evaluate(prog, data, threads):
     return dspy.Evaluate(
         devset=data, metric=metric, num_threads=threads, display_progress=True
     )(prog)
@@ -224,17 +269,24 @@ def main():
     budget = next(
         (a for a in ("light", "medium", "heavy") if f"--{a}" in sys.argv), "light"
     )
+    threads = int(
+        next(
+            (sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--threads"),
+            4,
+        )
+    )
     task_model = "gemma4:e4b" if mini else "gemma4:31b"
-    print(f"→ task: {task_model}    budget: {budget}")
+    print(f"→ task: {task_model}    budget: {budget}    threads: {threads}")
+    print(f"  tip: export OLLAMA_NUM_PARALLEL={threads} for true parallel decoding.")
 
-    dspy.configure(lm=make_lm(task_model, temperature=0.0, max_tokens=512))
+    dspy.configure(lm=make_lm(task_model, temperature=0.0, max_tokens=768), cache=True)
     train, val, test = load_splits()
     print(f"  train={len(train)}  val={len(val)}  test={len(test)}")
 
     prog = ToolUseProgram()
     print("\nbaseline...")
     t = time.time()
-    base = evaluate(prog, test)
+    base = evaluate(prog, test, threads)
     print(f"  {base:.3f}  ({time.time() - t:.0f}s)")
 
     print("\nGEPA optimizing...")
@@ -246,22 +298,33 @@ def main():
 
     print("\noptimized...")
     t = time.time()
-    opt = evaluate(optimized, test)
+    opt = evaluate(optimized, test, threads)
     print(f"  {opt:.3f}  ({time.time() - t:.0f}s)")
 
     out = Path("optimized_program")
     out.mkdir(exist_ok=True)
     optimized.save(str(out / "program.json"))
+    instructions = {
+        n: p.signature.instructions for n, p in optimized.named_predictors()
+    }
     summary = {
+        "bfcl_version": "v4",
+        "task_model": task_model,
+        "predictor": "ChainOfThought",
+        "n_train": len(train),
+        "n_val": len(val),
+        "n_test": len(test),
         "baseline": round(base, 4),
         "optimized": round(opt, 4),
         "delta": round(opt - base, 4),
-        "instruction": optimized.select.signature.instructions,
+        "instructions": instructions,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
     print(f"\nbaseline {base:.3f} → optimized {opt:.3f}  (Δ {opt - base:+.3f})")
-    print("─" * 70 + "\n" + summary["instruction"] + "\n" + "─" * 70)
+    for name, instr in instructions.items():
+        print(f"\n── {name} " + "─" * max(0, 66 - len(name)))
+        print(instr)
 
 
 if __name__ == "__main__":
