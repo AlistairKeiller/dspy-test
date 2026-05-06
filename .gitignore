@@ -8,3 +8,4 @@ wheels/
 
 # Virtual environments
 .venv
+.bfcl_v4_data

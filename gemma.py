@@ -60,7 +60,7 @@ def to_examples(rows):
     ]
 
 
-def load_splits(train_n=50, val_n=40, test_n=150, seed=42):
+def load_splits(train_n=80, val_n=50, test_n=150, seed=42):
     DATA.mkdir(exist_ok=True)
     for r in FILES.values():
         fetch(r, DATA / r)
@@ -107,7 +107,7 @@ class SelectToolCall(dspy.Signature):
 class ToolUseProgram(dspy.Module):
     def __init__(self):
         super().__init__()
-        self.select = dspy.ChainOfThought(SelectToolCall)
+        self.select = dspy.Predict(SelectToolCall)
 
     def forward(self, request, tools):
         return self.select(request=request, tools=tools)
@@ -246,16 +246,9 @@ def make_lm(model, **kw):
 
 
 def reflection_lm():
-    if os.getenv("ANTHROPIC_API_KEY"):
-        print("→ reflection: Claude")
-        return dspy.LM("anthropic/claude-opus-4-5", temperature=1.0, max_tokens=32000)
-    if os.getenv("OPENAI_API_KEY"):
-        print("→ reflection: GPT")
-        return dspy.LM("openai/gpt-5", temperature=1.0, max_tokens=32000)
-    print(
-        "→ reflection: local gemma4:31b (set ANTHROPIC_API_KEY or OPENAI_API_KEY for speed/quality)"
-    )
-    return make_lm("gemma4:31b", temperature=1.0, max_tokens=8000)
+    model = os.getenv("REFLECTION_MODEL", "gemma4:e4b")
+    print(f"→ reflection: {model}")
+    return make_lm(model, temperature=1.0, max_tokens=8192)
 
 
 def evaluate(prog, data, threads):
@@ -275,11 +268,13 @@ def main():
             4,
         )
     )
-    task_model = "gemma4:e4b" if mini else "gemma4:31b"
+    task_model = os.getenv("TASK_MODEL", "gemma4:e4b" if mini else "gemma4:e4b")
     print(f"→ task: {task_model}    budget: {budget}    threads: {threads}")
-    print(f"  tip: export OLLAMA_NUM_PARALLEL={threads} for true parallel decoding.")
+    print(
+        f"  tip: export OLLAMA_NUM_PARALLEL={threads} OLLAMA_KEEP_ALIVE=30m before starting Ollama."
+    )
 
-    dspy.configure(lm=make_lm(task_model, temperature=0.0, max_tokens=768), cache=True)
+    dspy.configure(lm=make_lm(task_model, temperature=0.0, max_tokens=512), cache=True)
     train, val, test = load_splits()
     print(f"  train={len(train)}  val={len(val)}  test={len(test)}")
 
@@ -310,7 +305,7 @@ def main():
     summary = {
         "bfcl_version": "v4",
         "task_model": task_model,
-        "predictor": "ChainOfThought",
+        "predictor": "Predict",
         "n_train": len(train),
         "n_val": len(val),
         "n_test": len(test),
