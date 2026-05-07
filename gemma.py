@@ -246,7 +246,7 @@ def make_lm(model, **kw):
 
 
 def reflection_lm():
-    model = os.getenv("REFLECTION_MODEL", "qwen3-coder:30b")
+    model = os.getenv("REFLECTION_MODEL", "gemma4:e4b")
     print(f"→ reflection: {model}")
     return make_lm(model, temperature=1.0, max_tokens=8192)
 
@@ -268,9 +268,7 @@ def main():
             4,
         )
     )
-    task_model = os.getenv(
-        "TASK_MODEL", "qwen3-coder:30b" if mini else "qwen3-coder:30b"
-    )
+    task_model = os.getenv("TASK_MODEL", "qwen3-coder:30b" if mini else "gemma4:e4b")
     print(f"→ task: {task_model}    budget: {budget}    threads: {threads}")
     print(
         f"  tip: export OLLAMA_NUM_PARALLEL={threads} OLLAMA_KEEP_ALIVE=30m before starting Ollama."

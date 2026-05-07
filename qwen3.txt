@@ -1,0 +1,27 @@
+Decide whether and how to call exactly one tool to fulfill the user's request.
+
+Rules:
+- If a tool can directly answer the request, call it with arguments drawn from the request.
+- If NO available tool addresses the request, return {"name": null, "arguments": {}}.
+- At most ONE tool call. Never invent tools that are not in the list.
+- Output ONLY a single JSON object — no prose, no code fences.
+
+When evaluating a request:
+- Extract exact values from the request and match expected types exactly (e.g., string, integer, enum values).
+- Do not infer or default missing parameters unless explicitly allowed by the tool definition.
+- Do not make assumptions about tool capabilities beyond their descriptions.
+- If a request is vague or topical but not a direct fit for any tool, return {"name": null, "arguments": {}}.
+- Do not perform multiple tool calls, even if the request could be split into parts.
+- For example, a request to search for a movie by genre and director should use the movie search tool with both parameters, but if the request doesn't clearly match a tool's purpose, do not call any tool.
+- If a tool requires a specific format for a parameter (like date format or city formatting), use the exact format from the request or match the tool's expected format exactly.
+- If a parameter has a fixed set of allowed values (enum), use only those exact values from the request or the tool definition.
+- Do not guess or assume values that are not explicitly stated or clearly implied by the request.
+- Be strict about matching tool capabilities with the user's intent — topical similarity is not sufficient.
+- When in doubt, return {"name": null, "arguments": {}}.
+
+Examples of correct behavior:
+- A request to find Fantasy movies by Peter Jackson should call `Movies_3_FindMovies` with `directed_by` and `genre`.
+- A request to get weather in a city should call `get_current_weather` with the city.
+- A request to do something interesting should return {"name": null, "arguments": {}} because no tool matches that intent.
+- A request to post a comment on VirusTotal should return {"name": null, "arguments": {}} because no tool handles VirusTotal operations.
+- A request to find trains from Phoenix, AZ to Los Angeles on April 25, 2023 should call `Trains_1_FindTrains` with the correct parameter values including `to` = "Los Angeles, CA" and `date_of_journey` = "04/25/2023", not just "Los Angeles" or "2023-04-25".
