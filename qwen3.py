@@ -246,7 +246,7 @@ def make_lm(model, **kw):
 
 
 def reflection_lm():
-    model = os.getenv("REFLECTION_MODEL", "qwen3-coder:30b")
+    model = os.getenv("REFLECTION_MODEL", "gemma4:e4b")
     print(f"→ reflection: {model}")
     return make_lm(model, temperature=1.0, max_tokens=8192)
 
@@ -268,7 +268,7 @@ def main():
             4,
         )
     )
-    task_model = os.getenv("TASK_MODEL", "qwen3:8b" if mini else "qwen3-coder:30b")
+    task_model = os.getenv("TASK_MODEL", "qwen3-coder:30b" if mini else "gemma4:e4b")
     print(f"→ task: {task_model}    budget: {budget}    threads: {threads}")
     print(
         f"  tip: export OLLAMA_NUM_PARALLEL={threads} OLLAMA_KEEP_ALIVE=30m before starting Ollama."
@@ -309,14 +309,14 @@ def main():
         "n_train": len(train),
         "n_val": len(val),
         "n_test": len(test),
-        "baseline": round(base, 4),
-        "optimized": round(opt, 4),
-        "delta": round(opt - base, 4),
+        "baseline": round(base.score, 4),
+        "optimized": round(opt.score, 4),
+        "delta": round(opt.score - base.score, 4),
         "instructions": instructions,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    print(f"\nbaseline {base} → optimized {opt}  (Δ {opt - base})")
+    print(f"\nbaseline {base} → optimized {opt}  (Δ {opt.score - base.score})")
     for name, instr in instructions.items():
         print(f"\n── {name} " + "─" * max(0, 66 - len(name)))
         print(instr)
