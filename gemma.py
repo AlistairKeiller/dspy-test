@@ -203,8 +203,14 @@ def score_call(pred, gold, tools):
                 f"`{a}`={args[a]!r} ({kind}); expected one of {gold_args[a]!r}"
             )
     for a in optional:
-        if a in args and matches(args[a], gold_args[a]):
+        if a not in args:
             correct += 1
+        elif matches(args[a], gold_args[a]):
+            correct += 1
+        else:
+            issues.append(
+                f"optional `{a}`={args[a]!r} is wrong; expected one of {gold_args[a]!r} or omitted"
+            )
     extra = [a for a in args if a not in gold_args]
     if extra:
         issues.append(
