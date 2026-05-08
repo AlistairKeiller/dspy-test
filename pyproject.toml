@@ -3,7 +3,8 @@ name = "roblox-test"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
+    "bfcl-eval>=2026.3.23",
     "dspy>=3.2.1",
 ]

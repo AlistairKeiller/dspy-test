@@ -1,244 +1,217 @@
 import json
 import os
 import random
+import re
 import sys
 import time
-import urllib.request
+import types
+from collections import Counter
+from importlib import resources
 from pathlib import Path
 
+# bfcl-eval's MODEL_CONFIG_MAPPING transitively imports every model SDK on the
+# planet (qwen-agent, cohere, anthropic, ...). Stub it before importing the checker.
+_stub = types.ModuleType("bfcl_eval.constants.model_config")
+
+
+class _DefaultCfg:
+    underscore_to_dot = False
+
+
+class _MapAny(dict):
+    def __getitem__(self, k):
+        return _DefaultCfg()
+
+    def __contains__(self, k):
+        return True
+
+
+_stub.MODEL_CONFIG_MAPPING = _MapAny()
+sys.modules["bfcl_eval.constants.model_config"] = _stub
+
 import dspy
+from bfcl_eval.eval_checker.ast_eval.ast_checker import ast_checker
 from dspy.teleprompt.gepa.gepa_utils import ScoreWithFeedback
 
-GH = "https://raw.githubusercontent.com/ShishirPatil/gorilla/main/berkeley-function-call-leaderboard/bfcl_eval/data"
-DATA = Path(".bfcl_v4_data")
-FILES = {
-    "mq": "BFCL_v4_live_multiple.json",
-    "ma": "possible_answer/BFCL_v4_live_multiple.json",
-    "rq": "BFCL_v4_live_relevance.json",
-    "iq": "BFCL_v4_live_irrelevance.json",
-}
-MAX_TOOLS_CHARS = 6000
+
+def _resolve_lang():
+    for path in (
+        "bfcl_eval.constants.enums",
+        "bfcl_eval.eval_checker.ast_eval.ast_checker",
+    ):
+        try:
+            return __import__(path, fromlist=["Language"]).Language.PYTHON
+        except (ImportError, AttributeError):
+            pass
+    return "python"
 
 
-def fetch(remote, local):
-    if not local.exists():
-        local.parent.mkdir(parents=True, exist_ok=True)
-        print(f"  ↓ {remote}")
-        urllib.request.urlretrieve(f"{GH}/{remote}", local)
+PYTHON_LANG = _resolve_lang()
 
 
-def load_jsonl(path):
-    return [json.loads(line) for line in open(path) if line.strip()]
+CATEGORIES = ["live_simple", "live_multiple", "live_relevance", "live_irrelevance"]
+TAG = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+NULL_CALL = '{"name": null, "arguments": {}}'
 
 
-def make_rows(qs, answers=None, synth_truth=False):
-    out = []
-    for q in qs:
-        msgs = q["question"][0]
-        text = "\n".join(m["content"] for m in msgs if m.get("role") == "user")
-        tools_json = json.dumps(q["function"], separators=(",", ":"))
-        if len(tools_json) > MAX_TOOLS_CHARS:
-            continue
-        if answers is not None:
-            gt = answers.get(q["id"], [])
-        elif synth_truth and q["function"]:
-            gt = [{q["function"][0]["name"]: {}}]
-        else:
-            gt = []
-        out.append({"request": text, "tools": q["function"], "ground_truth": gt})
-    return out
+def load_examples():
+    base = resources.files("bfcl_eval") / "data"
+    rows = []
+    for cat in CATEGORIES:
+        qs = [
+            json.loads(l)
+            for l in (base / f"BFCL_v4_{cat}.json").read_text().splitlines()
+            if l.strip()
+        ]
+        try:
+            ans_path = base / "possible_answer" / f"BFCL_v4_{cat}.json"
+            answers = {
+                r["id"]: r["ground_truth"]
+                for r in (
+                    json.loads(l)
+                    for l in ans_path.read_text().splitlines()
+                    if l.strip()
+                )
+            }
+        except FileNotFoundError:
+            answers = None
+        for q in qs:
+            text = "\n".join(
+                m["content"]
+                for m in q["question"][0]
+                if m.get("role") in {"user", "system"}
+            )
+            rows.append(
+                dspy.Example(
+                    request=text,
+                    tools=json.dumps(q["function"], separators=(",", ":")),
+                    gold_json=json.dumps(answers[q["id"]]) if answers else "null",
+                    category=cat,
+                ).with_inputs("request", "tools")
+            )
+    return rows
 
 
-def to_examples(rows):
-    return [
-        dspy.Example(
-            request=r["request"],
-            tools=json.dumps(r["tools"], separators=(",", ":")),
-            ground_truth=json.dumps(r["ground_truth"], separators=(",", ":")),
-        ).with_inputs("request", "tools")
-        for r in rows
-    ]
+class ToolApplies(dspy.Signature):
+    """Decide whether any of the offered tools can directly fulfill the user's request.
 
-
-def load_splits(train_n=80, val_n=50, test_n=150, seed=42):
-    DATA.mkdir(exist_ok=True)
-    for r in FILES.values():
-        fetch(r, DATA / r)
-    rng = random.Random(seed)
-
-    mult = make_rows(
-        load_jsonl(DATA / FILES["mq"]),
-        {r["id"]: r["ground_truth"] for r in load_jsonl(DATA / FILES["ma"])},
-    )
-    rel = make_rows(load_jsonl(DATA / FILES["rq"]), synth_truth=True)
-    irrel = make_rows(load_jsonl(DATA / FILES["iq"]))
-    rng.shuffle(mult)
-    rng.shuffle(rel)
-    rng.shuffle(irrel)
-
-    n = train_n + val_n + test_n
-    n_irrel, n_mult = n // 2, int(n * 0.35)
-    n_rel = n - n_irrel - n_mult
-    pool = mult[:n_mult] + rel[:n_rel] + irrel[:n_irrel]
-    rng.shuffle(pool)
-    examples = to_examples(pool)
-    return (
-        examples[:train_n],
-        examples[train_n : train_n + val_n],
-        examples[train_n + val_n : n],
-    )
-
-
-class SelectToolCall(dspy.Signature):
-    """Decide whether and how to call exactly one tool to fulfill the user's request.
-
-    Rules:
-    - If a tool can directly answer the request, call it with arguments drawn from the request.
-    - If NO available tool addresses the request, return {"name": null, "arguments": {}}.
-    - At most ONE tool call. Never invent tools that are not in the list.
-    - Output ONLY a single JSON object — no prose, no code fences.
+    A tool 'applies' only when the user's stated intent maps onto the tool's stated purpose.
+    Topical proximity does NOT count: a tool about X cannot do Y just because both share a domain.
     """
 
     request: str = dspy.InputField()
     tools: str = dspy.InputField(desc="JSON list of available tool schemas.")
-    tool_call: str = dspy.OutputField(desc='{"name": <tool|null>, "arguments": {...}}')
+    applies: bool = dspy.OutputField(
+        desc="True iff at least one offered tool can fulfill the request."
+    )
+
+
+class CallTool(dspy.Signature):
+    """Pick exactly one offered tool and emit a single JSON call.
+
+    Extract argument values verbatim from the request — never invent or modify values.
+    Match expected types exactly (string vs integer vs boolean vs list).
+    Output ONLY the JSON object, no prose, no code fences.
+    """
+
+    request: str = dspy.InputField()
+    tools: str = dspy.InputField(desc="JSON list of available tool schemas.")
+    tool_call: str = dspy.OutputField(desc='{"name": <tool>, "arguments": {...}}')
 
 
 class ToolUseProgram(dspy.Module):
     def __init__(self):
         super().__init__()
-        self.select = dspy.Predict(SelectToolCall)
+        self.applies = dspy.Predict(ToolApplies)
+        self.call = dspy.Predict(CallTool)
 
     def forward(self, request, tools):
-        return self.select(request=request, tools=tools)
+        if not self.applies(request=request, tools=tools).applies:
+            return dspy.Prediction(tool_call=NULL_CALL)
+        return self.call(request=request, tools=tools)
 
 
-def parse_call(raw):
+def parse(raw):
     if not raw:
         return None
-    s = raw.strip().strip("`")
+    s = (m.group(1) if (m := TAG.search(raw)) else raw).strip()
+    s = s.lstrip("`").lstrip()
     if s.lower().startswith("json"):
-        s = s[4:].strip()
-    if "{" in s and not s.startswith("{"):
-        s = s[s.find("{") :]
-    if s.endswith("```"):
-        s = s[:-3].rstrip()
+        s = s[4:].lstrip()
+    i = next((p for p in (s.find("{"), s.find("[")) if p >= 0), -1)
+    if i < 0:
+        return None
     try:
-        obj = json.loads(s)
+        obj, _ = json.JSONDecoder().raw_decode(s[i:])
     except Exception:
         return None
+    if isinstance(obj, list):
+        obj = obj[0] if obj else None
     if not isinstance(obj, dict):
         return None
-    name = obj.get("name")
-    args = obj.get("arguments") or obj.get("args") or {}
-    if not isinstance(args, dict):
-        args = {}
-    if isinstance(name, str) and name.lower() == "null":
-        name = None
-    return {"name": name if isinstance(name, str) else None, "arguments": args}
+    raw_name = obj.get("name")
+    name = (
+        raw_name if isinstance(raw_name, str) and raw_name.lower() != "null" else None
+    )
+    args = next(
+        (
+            a
+            for a in (obj.get("arguments"), obj.get("args"), obj.get("parameters"))
+            if isinstance(a, dict)
+        ),
+        {},
+    )
+    return name, args
 
 
-def matches(pred, accepted):
-    if pred in accepted:
-        return True
-    if isinstance(pred, (int, float)):
-        return any(
-            isinstance(a, (int, float)) and abs(pred - a) < 1e-6 for a in accepted
-        )
-    if isinstance(pred, str):
-        p = pred.lower().strip()
-        return any(isinstance(a, str) and a.lower().strip() == p for a in accepted)
-    if isinstance(pred, list):
-        return any(
-            isinstance(a, list)
-            and len(a) == len(pred)
-            and all(matches(x, [y]) for x, y in zip(pred, a))
-            for a in accepted
-        )
-    return False
+def _score(gold, pred):
+    """(score: 0.0 or 1.0, feedback: str). Feedback embeds the request and offered
+    tools so GEPA's reflection LM can learn failure-mode patterns, not just rules."""
+    parsed = parse(getattr(pred, "tool_call", None))
+    cat = gold.category
+    tools = json.loads(gold.tools)
+    req = gold.request[:240].replace("\n", " ")
+    offered = [t["name"] for t in tools]
 
-
-def score_call(pred, gold, tools):
-    name, args = pred["name"], pred["arguments"]
-    if not gold:
-        if name is None:
-            return 1.0, "Correctly abstained — no tool fits this request."
+    if cat == "live_irrelevance":
+        if not parsed or parsed[0] is None:
+            return 1.0, "Correctly abstained — no offered tool fits."
         return 0.0, (
-            f"Over-called `{name}`: none of the available tools fit this request. "
-            'When the user\'s intent does not clearly map to a tool, output {"name": null, "arguments": {}}. '
-            "Topical proximity is not the same as fit — read each description literally."
+            f'OVER-CALLED on: "{req}"\n'
+            f"You called `{parsed[0]}`, but none of the offered tools {offered} "
+            f"actually address this request. Read each tool description literally — "
+            f"topical proximity to a tool name is NOT the same as that tool fitting the request."
         )
-    gold_name, gold_args = next(iter(gold[0].items()))
-    if name is None:
-        return (
-            0.0,
-            f"Under-called: should have invoked `{gold_name}`. The user's request maps to this tool.",
-        )
-    if name != gold_name:
-        gold_desc = next(
-            (t.get("description", "") for t in tools if t.get("name") == gold_name), ""
-        )
+
+    if cat == "live_relevance":
+        if parsed and parsed[0] in offered:
+            return 1.0, f"Correctly invoked `{parsed[0]}`."
         return 0.0, (
-            f"Wrong tool: predicted `{name}`, expected `{gold_name}` — for: {gold_desc[:180]}. "
-            "Pick the tool whose stated purpose most directly matches the request."
+            f'UNDER-CALLED on: "{req}"\n'
+            f"At least one of the offered tools {offered} fits this request — pick the most relevant."
         )
-    if not gold_args:
-        return 1.0, f"Correctly invoked `{gold_name}`."
-    required = [a for a, acc in gold_args.items() if "" not in acc]
-    optional = [a for a in gold_args if a not in required]
-    correct, issues = 0, []
-    for a in required:
-        if a not in args:
-            issues.append(f"missing required `{a}`")
-        elif matches(args[a], gold_args[a]):
-            correct += 1
-        else:
-            ref = next((v for v in gold_args[a] if v != ""), None)
-            kind = (
-                "wrong type"
-                if ref is not None and type(args[a]) is not type(ref)
-                else "wrong value"
-            )
-            issues.append(
-                f"`{a}`={args[a]!r} ({kind}); expected one of {gold_args[a]!r}"
-            )
-    for a in optional:
-        if a not in args:
-            correct += 1
-        elif matches(args[a], gold_args[a]):
-            correct += 1
-        else:
-            issues.append(
-                f"optional `{a}`={args[a]!r} is wrong; expected one of {gold_args[a]!r} or omitted"
-            )
-    extra = [a for a in args if a not in gold_args]
-    if extra:
-        issues.append(
-            f"unrequested args {extra} — only include args the user specified"
+
+    # AST: live_simple, live_multiple
+    if not parsed or parsed[0] is None:
+        return 0.0, (
+            f'NO CALL on: "{req}"\nThis request requires invoking one of: {offered}.'
         )
-    total = len(required) + len(optional)
-    score = 0.5 + 0.5 * (correct / total if total else 1.0)
-    if score == 1.0 and not issues:
-        return 1.0, f"Perfect call to `{gold_name}`."
-    return score, (
-        f"Right tool (`{gold_name}`), but: "
-        + "; ".join(issues)
-        + ". Extract values directly from the request and match expected types exactly."
+    name, args = parsed
+    result = ast_checker(
+        tools, [{name: args}], json.loads(gold.gold_json), PYTHON_LANG, cat, "any-model"
+    )
+    if result["valid"]:
+        return 1.0, f"Correct call to `{name}`."
+    errs = "; ".join(result.get("error", []))[:400]
+    return 0.0, (
+        f'WRONG CALL on: "{req}"\n'
+        f"You emitted: {name}({args})\n"
+        f"BFCL official check: {errs}"
     )
 
 
 def metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
-    call = parse_call(getattr(pred, "tool_call", None))
-    if call is None:
-        s, fb = (
-            0.0,
-            (
-                "Output was not valid JSON. Always emit a single JSON object: "
-                '{"name": <tool|null>, "arguments": {...}} with no prose, fences, or trailing commas.'
-            ),
-        )
-    else:
-        s, fb = score_call(call, json.loads(gold.ground_truth), json.loads(gold.tools))
+    s, fb = _score(gold, pred)
     return ScoreWithFeedback(score=s, feedback=fb) if pred_name else s
 
 
@@ -251,58 +224,78 @@ def make_lm(model, **kw):
     )
 
 
-def reflection_lm():
-    model = os.getenv("REFLECTION_MODEL", "qwen3-coder:30b")
-    print(f"→ reflection: {model}")
-    return make_lm(model, temperature=1.0, max_tokens=8192)
+def per_category(results):
+    by = {}
+    for ex, _, sc in results:
+        v = sc if isinstance(sc, (int, float)) else getattr(sc, "score", 0)
+        by.setdefault(ex.category, []).append(v)
+    return {c: round(100 * sum(v) / len(v), 2) for c, v in by.items()}
 
 
-def evaluate(prog, data, threads):
-    return dspy.Evaluate(
-        devset=data, metric=metric, num_threads=threads, display_progress=True
-    )(prog)
+def split_balanced(rows, train_n, val_n, test_n, seed=42):
+    rng = random.Random(seed)
+    by_cat = {}
+    for r in rows:
+        by_cat.setdefault(r.category, []).append(r)
+    for rs in by_cat.values():
+        rng.shuffle(rs)
+    n_each = (train_n + val_n + test_n) // len(by_cat) + 1
+    pool = [r for cat in by_cat for r in by_cat[cat][:n_each]]
+    rng.shuffle(pool)
+    return (
+        pool[:train_n],
+        pool[train_n : train_n + val_n],
+        pool[train_n + val_n : train_n + val_n + test_n],
+    )
 
 
 def main():
-    mini = "--mini" in sys.argv
     budget = next(
         (a for a in ("light", "medium", "heavy") if f"--{a}" in sys.argv), "light"
     )
-    threads = int(
-        next(
-            (sys.argv[i + 1] for i, a in enumerate(sys.argv[:-1]) if a == "--threads"),
-            4,
-        )
-    )
-    task_model = os.getenv(
-        "TASK_MODEL", "qwen3-coder:30b" if mini else "qwen3-coder:30b"
-    )
-    print(f"→ task: {task_model}    budget: {budget}    threads: {threads}")
+    threads = int(os.getenv("THREADS", "4"))
+    task_model = os.getenv("TASK_MODEL", "qwen3-coder:30b")
+    refl_model = os.getenv("REFLECTION_MODEL", "qwen3-coder:30b")
     print(
-        f"  tip: export OLLAMA_NUM_PARALLEL={threads} OLLAMA_KEEP_ALIVE=30m before starting Ollama."
+        f"→ task: {task_model}    reflection: {refl_model}    budget: {budget}    threads: {threads}"
     )
 
     dspy.configure(lm=make_lm(task_model, temperature=0.0, max_tokens=512), cache=True)
-    train, val, test = load_splits()
-    print(f"  train={len(train)}  val={len(val)}  test={len(test)}")
+    train, val, test = split_balanced(
+        load_examples(), train_n=100, val_n=100, test_n=200
+    )
+    print(
+        f"  train={len(train)}  val={len(val)}  test={len(test)}  {dict(Counter(e.category for e in test))}"
+    )
 
     prog = ToolUseProgram()
+
     print("\nbaseline...")
     t = time.time()
-    base = evaluate(prog, test, threads)
-    print(f"  {base}  ({time.time() - t:.0f}s)")
+    base = dspy.Evaluate(
+        devset=test, metric=metric, num_threads=threads, display_progress=True
+    )(prog)
+    print(
+        f"  {base.score:.2f}  per-cat={per_category(base.results)}  ({time.time() - t:.0f}s)"
+    )
 
     print("\nGEPA optimizing...")
     t = time.time()
     optimized = dspy.GEPA(
-        metric=metric, reflection_lm=reflection_lm(), auto=budget
+        metric=metric,
+        reflection_lm=make_lm(refl_model, temperature=1.0, max_tokens=8192),
+        auto=budget,
     ).compile(prog, trainset=train, valset=val)
     print(f"  done ({time.time() - t:.0f}s)")
 
     print("\noptimized...")
     t = time.time()
-    opt = evaluate(optimized, test, threads)
-    print(f"  {opt}  ({time.time() - t:.0f}s)")
+    opt = dspy.Evaluate(
+        devset=test, metric=metric, num_threads=threads, display_progress=True
+    )(optimized)
+    print(
+        f"  {opt.score:.2f}  per-cat={per_category(opt.results)}  ({time.time() - t:.0f}s)"
+    )
 
     out = Path("optimized_program")
     out.mkdir(exist_ok=True)
@@ -311,20 +304,18 @@ def main():
         n: p.signature.instructions for n, p in optimized.named_predictors()
     }
     summary = {
-        "bfcl_version": "v4",
-        "task_model": task_model,
-        "predictor": "Predict",
-        "n_train": len(train),
-        "n_val": len(val),
-        "n_test": len(test),
-        "baseline": round(base.score, 4),
-        "optimized": round(opt.score, 4),
-        "delta": round(opt.score - base.score, 4),
+        "baseline": round(base.score, 2),
+        "optimized": round(opt.score, 2),
+        "delta": round(opt.score - base.score, 2),
+        "baseline_per_category": per_category(base.results),
+        "optimized_per_category": per_category(opt.results),
         "instructions": instructions,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    print(f"\nbaseline {base} → optimized {opt}  (Δ {opt.score - base.score})")
+    print(
+        f"\nbaseline {base.score:.2f} → optimized {opt.score:.2f}  (Δ {opt.score - base.score:+.2f})"
+    )
     for name, instr in instructions.items():
         print(f"\n── {name} " + "─" * max(0, 66 - len(name)))
         print(instr)
